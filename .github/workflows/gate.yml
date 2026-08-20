@@ -1,0 +1,83 @@
+# Demo: launchbound's convergence safety gate as a GitHub Action — no GPU
+# anywhere. Two kernels, both directions:
+#   - a known-clean space must stay clean (fail-on: refused)
+#   - a known-flip space must be caught (the job asserts refusals happened)
+name: convergence-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate-clean:
+    name: clean kernel stays clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: demo
+      # The kernels' cuda-device path dependency resolves against this
+      # sibling checkout, pinned to the commit the crates expect.
+      - uses: actions/checkout@v4
+        with:
+          repository: NVlabs/cuda-oxide
+          ref: 50d07314eb8b7d5ec821ba02b0048a753c20dd4e
+          path: cuda-oxide
+      - name: Safety gate
+        id: gate
+        uses: vyncint/launchbound/action@v1
+        with:
+          kernel: demo/kernels/reduce-stable-demo
+          cc: "8.6"
+          fail-on: refused
+      - name: Show the verdict
+        run: |
+          echo "verdict=${{ steps.gate.outputs.verdict }}"
+          echo "admitted=${{ steps.gate.outputs.admitted }} refused=${{ steps.gate.outputs.refused }}"
+
+  gate-catches-the-flip:
+    name: known-flip kernel is caught
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: demo
+      - uses: actions/checkout@v4
+        with:
+          repository: NVlabs/cuda-oxide
+          ref: 50d07314eb8b7d5ec821ba02b0048a753c20dd4e
+          path: cuda-oxide
+      - name: Safety gate (report, never fail)
+        id: gate
+        uses: vyncint/launchbound/action@v1
+        with:
+          kernel: demo/kernels/reduce-flip-demo
+          cc: "8.6"
+          fail-on: never
+      - name: Assert the gate refused the multi-warp configs
+        env:
+          VERDICT: ${{ steps.gate.outputs.verdict }}
+          REFUSED: ${{ steps.gate.outputs.refused }}
+          ADMITTED: ${{ steps.gate.outputs.admitted }}
+          GATE_JSON: ${{ steps.gate.outputs.json }}
+        run: |
+          set -euo pipefail
+          echo "verdict=$VERDICT admitted=$ADMITTED refused=$REFUSED"
+          test "$VERDICT" = "refused"
+          test "$REFUSED" = "2"
+          test "$ADMITTED" = "2"
+          # Every refusal names RC001 and the source line.
+          echo "$GATE_JSON" | python3 -c "
+          import json, sys
+          doc = json.load(sys.stdin)
+          refused = [c for c in doc['candidates'] if c['verdict'] == 'disqualified']
+          assert len(refused) == 2, refused
+          for c in refused:
+              rules = c['records']
+              assert any(r['rule'] == 'RC001' and 'lib.rs' in (r.get('span') or '') for r in rules), c
+          print('the gate caught the flip: 2 refused, each with RC001 and a source span')
+          "
