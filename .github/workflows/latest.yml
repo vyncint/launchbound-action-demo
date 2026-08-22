@@ -1,0 +1,171 @@
+name: latest
+
+# Runs the same two gate directions against the newest **published**
+# launchbound, and checks that `@v1` still means what it says.
+#
+# `gate.yml` uses `vyncint/launchbound/action@v1` because that is what the
+# README tells a user to copy, and a demo should exercise what users get.
+# That makes it blind to exactly one failure, and it is the failure that
+# actually happened: `v1` is a floating tag somebody has to move, and when a
+# release forgets to, every consumer silently keeps the old action while the
+# demo goes on passing. `@v1` sat on 1.0.2 through two releases, so the demo
+# was gating with reconverge 0.1.11 while 1.2.0's whole point was pinning
+# 0.3.0.
+#
+# So this workflow asks the two questions gate.yml cannot:
+#
+#   1. does `@v1` resolve to the same action as the newest release tag?
+#   2. do the gate's invariants still hold against the newest published
+#      launchbound-cli and the reconverge version it pins?
+#
+# Both crates come from crates.io, never from a checkout of the tool repo.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: launchbound-cli version to test, or "latest"
+        required: false
+        default: latest
+  repository_dispatch:
+    types: [tool-published]
+  pull_request:
+    paths: [".github/workflows/latest.yml"]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  v1-is-current:
+    name: "@v1 is the newest release"
+    runs-on: ubuntu-latest
+    outputs:
+      newest: ${{ steps.newest.outputs.tag }}
+      version: ${{ steps.newest.outputs.version }}
+    steps:
+      - id: newest
+        name: Resolve the newest published launchbound-cli
+        run: |
+          set -euo pipefail
+          version=$(curl -sSf https://crates.io/api/v1/crates/launchbound-cli \
+            -H "User-Agent: launchbound-action-demo (github.com/vyncint/launchbound-action-demo)" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["crate"]["max_stable_version"])')
+          test -n "$version"
+          echo "newest published launchbound-cli is $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: The floating tag matches the release tag
+        env:
+          TAG: ${{ steps.newest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          base=https://raw.githubusercontent.com/vyncint/launchbound
+          curl -sSf "$base/v1/action/action.yml" -o floating.yml
+          curl -sSf "$base/$TAG/action/action.yml" -o release.yml || {
+            echo "::notice::$TAG carries no action/action.yml; nothing to compare"
+            exit 0
+          }
+          if diff -u floating.yml release.yml; then
+            echo "@v1 and $TAG are the same action"
+          else
+            echo "::error::@v1 does not match $TAG — the floating tag was not moved on release."
+            echo "::error::Every consumer following the documented @v1 is on the older action."
+            exit 1
+          fi
+
+  gate-at-newest:
+    name: ${{ matrix.name }} (newest published)
+    runs-on: ubuntu-latest
+    needs: [v1-is-current]
+    if: always() && needs.v1-is-current.outputs.version != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: clean kernel stays clean
+            kernel: demo/kernels/reduce-stable-demo
+            expect-verdict: admitted
+          - name: known-flip kernel is caught
+            kernel: demo/kernels/reduce-flip-demo
+            expect-verdict: refused
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: demo
+      - uses: actions/checkout@v4
+        with:
+          repository: NVlabs/cuda-oxide
+          ref: 50d07314eb8b7d5ec821ba02b0048a753c20dd4e
+          path: cuda-oxide
+
+      - name: Safety gate (report, never fail)
+        id: gate
+        uses: vyncint/launchbound/action@v1
+        with:
+          kernel: ${{ matrix.kernel }}
+          cc: "8.6"
+          fail-on: never
+          # The point of this workflow: the newest crate on crates.io, whatever
+          # the action ref happens to be pinned at.
+          version: ${{ needs.v1-is-current.outputs.version }}
+
+      - name: The verdict is the one this kernel is for
+        env:
+          VERDICT: ${{ steps.gate.outputs.verdict }}
+          REFUSED: ${{ steps.gate.outputs.refused }}
+          ADMITTED: ${{ steps.gate.outputs.admitted }}
+          ERRORS: ${{ steps.gate.outputs.tool-errors }}
+          WANT: ${{ matrix.expect-verdict }}
+          GATE_JSON: ${{ steps.gate.outputs.json }}
+        run: |
+          set -euo pipefail
+          echo "verdict=$VERDICT admitted=$ADMITTED refused=$REFUSED errors=$ERRORS"
+          test "${ERRORS:-0}" = "0" \
+            || { echo "::error::the analyzer reported $ERRORS tool error(s)"; exit 1; }
+          test "$VERDICT" = "$WANT" \
+            || { echo "::error::verdict is '$VERDICT', expected '$WANT'"; exit 1; }
+          # A gate that refuses everything is as useless as one that refuses
+          # nothing, so both kernels assert on the split rather than the label.
+          if [ "$WANT" = "refused" ]; then
+            test "$REFUSED" -gt 0 && test "$ADMITTED" -gt 0 \
+              || { echo "::error::a flip kernel with $ADMITTED admitted / $REFUSED refused says nothing"; exit 1; }
+            echo "$GATE_JSON" | python3 -c "
+          import json, sys
+          doc = json.load(sys.stdin)
+          refused = [c for c in doc['candidates'] if c['verdict'] == 'disqualified']
+          assert refused, 'no disqualified candidate in the report'
+          for c in refused:
+              assert any(r['rule'] == 'RC001' and 'lib.rs' in (r.get('span') or '')
+                         for r in c['records']), c
+          print(f'{len(refused)} refusal(s), each naming RC001 and a source span')
+          "
+          else
+            test "$REFUSED" = "0" \
+              || { echo "::error::the clean kernel had $REFUSED refusal(s)"; exit 1; }
+          fi
+
+  report:
+    name: report
+    runs-on: ubuntu-latest
+    needs: [v1-is-current, gate-at-newest]
+    if: failure() && github.event_name != 'pull_request'
+    steps:
+      - name: Open one issue per failing run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.v1-is-current.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="latest: the demo does not hold against launchbound ${VERSION}"
+          existing=$(gh issue list --repo "$REPO" --state open --search "$title in:title" \
+            --json number --jq '.[0].number // empty')
+          [ -n "$existing" ] && { echo "already reported as #$existing"; exit 0; }
+          gh issue create --repo "$REPO" --title "$title" --body "$(printf '%s\n\n- version: `%s`\n- run: %s\n\n%s\n' \
+            'The scheduled run against the newest published launchbound failed.' \
+            "$VERSION" "$RUN_URL" \
+            'Either the floating `@v1` tag is behind its release tag (the job says which), or the gate reached a different verdict than the kernel is built to produce. The second is the interesting one: these two kernels have a convergence property known by construction, so a changed verdict is a changed analyzer.')"
