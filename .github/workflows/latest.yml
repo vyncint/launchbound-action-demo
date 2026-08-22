@@ -88,7 +88,7 @@ jobs:
         include:
           - name: clean kernel stays clean
             kernel: demo/kernels/reduce-stable-demo
-            expect-verdict: admitted
+            expect-verdict: clean
           - name: known-flip kernel is caught
             kernel: demo/kernels/reduce-flip-demo
             expect-verdict: refused
@@ -126,6 +126,8 @@ jobs:
           echo "verdict=$VERDICT admitted=$ADMITTED refused=$REFUSED errors=$ERRORS"
           test "${ERRORS:-0}" = "0" \
             || { echo "::error::the analyzer reported $ERRORS tool error(s)"; exit 1; }
+          # The verdict vocabulary is clean/caveats/refused/tool-error -- the
+          # worst outcome present. `admitted` is a count, not a verdict.
           test "$VERDICT" = "$WANT" \
             || { echo "::error::verdict is '$VERDICT', expected '$WANT'"; exit 1; }
           # A gate that refuses everything is as useless as one that refuses
