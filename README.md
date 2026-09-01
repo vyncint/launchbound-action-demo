@@ -44,9 +44,10 @@ cannot:
    resolved from crates.io at run time rather than from the action's default.
 
 Both crates come from crates.io; nothing here is ever built from a checkout of
-the tool repository. It runs daily, on dispatch, and on `repository_dispatch`
-so a launchbound release can trigger it, and opens one issue per failing
-version rather than one per run.
+the tool repository. It runs on dispatch and on `repository_dispatch` so a
+launchbound release can trigger it, and opens one issue per failing version
+rather than one per run. The daily cron is commented out in
+[`latest.yml`](.github/workflows/latest.yml).
 
 A changed verdict here is worth reading carefully: these two kernels have a
 convergence property known *by construction*, so the gate reaching a different
