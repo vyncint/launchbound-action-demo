@@ -21,8 +21,9 @@ name: latest
 # Both crates come from crates.io, never from a checkout of the tool repo.
 
 on:
-  schedule:
-    - cron: "23 6 * * *"
+  # Scheduled runs are disabled. Uncomment the block below to restore them.
+  # schedule:
+  #   - cron: "23 6 * * *"
   workflow_dispatch:
     inputs:
       version:
